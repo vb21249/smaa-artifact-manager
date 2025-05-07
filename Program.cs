@@ -3,6 +3,7 @@ using CourseWork.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
 using System.Reflection;
+using Microsoft.Data.SqlClient;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -15,9 +16,19 @@ builder.WebHost.ConfigureKestrel(options =>
 // Add services to the container.
 builder.Services.AddControllers();
 
-// Configure DbContext
+// Configure DbContext with retry logic
 builder.Services.AddDbContext<ArtifactsDbContext>(options =>
-    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+{
+    options.UseSqlServer(
+        builder.Configuration.GetConnectionString("DefaultConnection"),
+        sqlServerOptionsAction: sqlOptions =>
+        {
+            sqlOptions.EnableRetryOnFailure(
+                maxRetryCount: 10,
+                maxRetryDelay: TimeSpan.FromSeconds(30),
+                errorNumbersToAdd: null);
+        });
+});
 
 // Register repositories and UnitOfWork
 builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
@@ -56,6 +67,46 @@ builder.Services.AddSwaggerGen(c =>
 });
 
 var app = builder.Build();
+
+// Initialize Database
+using (var scope = app.Services.CreateScope())
+{
+    var services = scope.ServiceProvider;
+    try
+    {
+        var context = services.GetRequiredService<ArtifactsDbContext>();
+
+        // Wait for SQL Server to be ready
+        var maxRetries = 10;
+        var retryDelay = TimeSpan.FromSeconds(10);
+        for (int i = 0; i < maxRetries; i++)
+        {
+            try
+            {
+                // Try to connect to the database
+                context.Database.GetPendingMigrations();
+                break;
+            }
+            catch (SqlException)
+            {
+                if (i == maxRetries - 1) throw;
+                Thread.Sleep(retryDelay);
+            }
+        }
+
+        // Create database if it doesn't exist
+        if (!context.Database.CanConnect())
+        {
+            context.Database.EnsureCreated();
+        }
+    }
+    catch (Exception ex)
+    {
+        var logger = services.GetRequiredService<ILogger<Program>>();
+        logger.LogError(ex, "An error occurred while initializing the database.");
+        throw;
+    }
+}
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
